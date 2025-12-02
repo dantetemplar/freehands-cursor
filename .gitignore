@@ -1,0 +1,51 @@
+debug_recordings/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Application data
+.voice_wakeup_cursor/
+*.log
+
+# Vosk models (large files)
+vosk_models/
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+

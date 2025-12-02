@@ -1,0 +1,30 @@
+[project]
+name = "freehands-cursor"
+version = "1.0.0"
+description = "Voice-activated hands-free управление Cursor IDE"
+requires-python = ">=3.12"
+dependencies = [
+    "vosk>=0.3.45",
+    "sounddevice>=0.4.6",
+    "pystray>=0.19.5",
+    "pillow>=10.0.0",
+    "psutil>=5.9.0",
+    "numpy>=1.24.0",
+    "silero-vad>=6.2.0",
+    "pynput>=1.7.6",
+]
+
+[project.scripts]
+freehands-cursor = "freehands_cursor.__init__:main"
+jarvis = "freehands_cursor.__init__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+lint.extend-select = ["I", "UP", "PL"]
+lint.extend-ignore = ["PLC0415", "PLR"]
+exclude = ["*.pyi"]
+target-version = "py312"
