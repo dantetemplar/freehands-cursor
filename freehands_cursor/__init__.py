@@ -12,14 +12,21 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
 import psutil
 import sounddevice as sd
-from pynput.keyboard import Controller, GlobalHotKeys, HotKey, Key
+from pynput import mouse
+from pynput.keyboard import Controller, HotKey, Key, Listener as KeyboardListener
 from vosk import KaldiRecognizer, Model, SetLogLevel
+
+try:
+    import pyperclip
+except ImportError:  # pragma: no cover - optional dependency
+    pyperclip = None
 
 # ===== CONFIG =====
 APP_HOME_DIR = Path.home() / ".freehands_cursor"
@@ -68,8 +75,7 @@ class AppState(StrEnum):
 
     IDLE = "idle"
     LISTENING = "listening"
-    PUSHED = "pushed"
-    RELEASED = "released"
+    CAPTURING = "capturing"
 
 
 # Platform checks
@@ -242,27 +248,12 @@ class SpeechDetector:
 
 # ===== KEY SIMULATION =====
 class KeySimulator:
-    """Имитация нажатий клавиш push-to-talk."""
+    """Имитация нажатий горячих клавиш."""
 
     DEFAULT_COMBOS = {
-        "Darwin": [Key.cmd, Key.space],
-        "Windows": [Key.ctrl, Key.shift, Key.space],
-        "Linux": [Key.ctrl, Key.shift, Key.space],
-    }
-
-    KEY_MAP = {
-        "cmd": Key.cmd,
-        "command": Key.cmd,
-        "win": Key.cmd,
-        "super": Key.cmd,
-        "meta": Key.cmd,
-        "control": Key.ctrl,
-        "ctrl": Key.ctrl,
-        "shift": Key.shift,
-        "alt": Key.alt,
-        "option": Key.alt,
-        "spacebar": Key.space,
-        "space": Key.space,
+        "Darwin": "<cmd>+<space>",
+        "Windows": "<ctrl>+<shift>+<space>",
+        "Linux": "<ctrl>+<shift>+<space>",
     }
 
     DISPLAY_MAP = {
@@ -273,62 +264,203 @@ class KeySimulator:
         Key.space: "Space",
     }
 
-    def __init__(self, combo_select_chat_input: str = "<ctrl>+<insert>"):
+    KEY_ALIASES = {
+        "command": "cmd",
+        "win": "cmd",
+        "super": "cmd",
+        "meta": "cmd",
+        "control": "ctrl",
+        "option": "alt",
+        "spacebar": "space",
+    }
+
+    def __init__(self, combo_text: str | None = None):
         self.system = platform.system()
         self.keyboard = Controller()
-        self.combo_select_chat_input = HotKey.parse(combo_select_chat_input)
-        self.is_pressed = False
-        logger.info("Hotkey set to %s", self.get_key_combination())
+        self.combo_text = combo_text or self.DEFAULT_COMBOS.get(self.system, "<ctrl>+<shift>+<space>")
+        self.key_sequence = self._parse_combo_text(self.combo_text)
+        logger.info("Комбинация горячих клавиш: %s", self.get_key_display())
 
-    def _resolve_combo(self, custom_combo):
-        if custom_combo:
-            parsed = self._parse_combo(custom_combo)
-            if parsed:
-                return parsed
-            logger.warning(f"Failed to parse combo '{custom_combo}', using default")
-        return self.DEFAULT_COMBOS.get(self.system, [Key.ctrl, Key.shift, Key.space])
+    def _parse_combo_text(self, combo_text: str):
+        normalized = self._normalize_combo(combo_text)
+        try:
+            sequence = list(HotKey.parse(normalized))
+        except ValueError:
+            fallback = self.DEFAULT_COMBOS.get(self.system, "<ctrl>+<shift>+<space>")
+            logger.warning("Не удалось разобрать комбинацию '%s', используем %s", combo_text, fallback)
+            normalized = self._normalize_combo(fallback)
+            sequence = list(HotKey.parse(normalized))
+        self.combo_text = normalized
+        return sequence
 
-    def _parse_combo(self, combo):
-        parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
-        if not parts:
-            return []
-        result = []
-        for part in parts:
-            key = self.KEY_MAP.get(part)
-            if key:
-                result.append(key)
+    def _normalize_combo(self, combo_text: str):
+        tokens = [token.strip() for token in combo_text.replace(" ", "").split("+") if token.strip()]
+        normalized_parts = []
+        for token in tokens:
+            token_lower = token.lower()
+            if token_lower.startswith("<") and token_lower.endswith(">"):
+                normalized_parts.append(token_lower)
+                continue
+            alias = self.KEY_ALIASES.get(token_lower, token_lower)
+            if len(alias) == 1:
+                normalized_parts.append(alias)
             else:
-                logger.warning(f"Unknown key: {part}")
-        return result if result else None
+                normalized_parts.append(f"<{alias}>")
+        return "+".join(normalized_parts)
 
-    def press_select_chat_input(self):
-        if self.is_pressed:
-            return
-        try:
-            for key in self.key_sequence:
-                self.keyboard.press(key)
-                time.sleep(0.01)  # Small delay between key presses
-            self.is_pressed = True
-            logger.info("Push-to-talk pressed")
-        except Exception as e:
-            logger.error(f"Error pressing push-to-talk: {e}")
-            self.is_pressed = False
+    def tap(self, times=1, delay_between=0.2):
+        for index in range(times):
+            self._press_sequence()
+            self._release_sequence()
+            if index < times - 1:
+                time.sleep(delay_between)
 
-    def release_push_to_talk(self):
-        if not self.is_pressed:
-            return
-        try:
-            for key in reversed(self.key_sequence):
-                self.keyboard.release(key)
-                time.sleep(0.01)  # Small delay between key releases
-            self.is_pressed = False
-            logger.info("Push-to-talk released")
-        except Exception as e:
-            logger.error(f"Error releasing push-to-talk: {e}")
+    def _press_sequence(self):
+        for key in self.key_sequence:
+            self.keyboard.press(key)
+            time.sleep(0.01)
 
-    def get_key_combination(self):
-        parts = [self.DISPLAY_MAP.get(key, str(key)) for key in self.key_sequence]
+    def _release_sequence(self):
+        for key in reversed(self.key_sequence):
+            self.keyboard.release(key)
+            time.sleep(0.01)
+
+    def get_key_display(self):
+        parts = []
+        for key in self.key_sequence:
+            if key in self.DISPLAY_MAP:
+                parts.append(self.DISPLAY_MAP[key])
+            else:
+                char = getattr(key, "char", None)
+                if char:
+                    parts.append(char.upper())
+                else:
+                    parts.append(str(key))
         return "+".join(parts)
+
+
+# ===== CLIPBOARD & USER ACTIVITY =====
+class ClipboardManager:
+    """Сохранение последнего сообщения в буфер."""
+
+    def __init__(self, enabled=True):
+        self.enabled = bool(enabled)
+        if self.enabled and pyperclip is None:
+            logger.warning("pyperclip недоступен, сохранение в буфер отключено")
+            self.enabled = False
+
+    def save(self, text: str):
+        if not self.enabled:
+            return
+        sanitized = (text or "").strip()
+        if not sanitized:
+            return
+        try:
+            pyperclip.copy(sanitized)
+            logger.info("Сообщение сохранено в буфер обмена")
+        except Exception as err:  # pragma: no cover - системный буфер может отсутствовать
+            logger.warning("Не удалось сохранить сообщение в буфер: %s", err)
+
+
+class UserActivityMonitor:
+    """Отслеживание пользовательского ввода для остановки автоматической печати."""
+
+    def __init__(self, enabled=True):
+        self.enabled = bool(enabled)
+        self.keyboard_listener = None
+        self.mouse_listener = None
+        self.active = False
+        self._interrupted = False
+        self._enter_pressed = False
+        self._ignore_depth = 0
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self.enabled:
+            return
+        if self.keyboard_listener is None:
+            self.keyboard_listener = KeyboardListener(on_press=self._on_key_press)
+            self.keyboard_listener.start()
+        if self.mouse_listener is None:
+            self.mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+            self.mouse_listener.start()
+
+    def shutdown(self):
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+            self.keyboard_listener = None
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+            self.mouse_listener = None
+
+    def begin_session(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self.active = True
+            self._interrupted = False
+            self._enter_pressed = False
+
+    def end_session(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self.active = False
+
+    @property
+    def was_interrupted(self):
+        if not self.enabled:
+            return False
+        with self._lock:
+            return self._interrupted
+
+    def consume_enter_pressed(self):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if self._enter_pressed:
+                self._enter_pressed = False
+                return True
+        return False
+
+    @contextmanager
+    def simulated_input(self):
+        if not self.enabled:
+            yield
+            return
+        self._increment_ignore_depth()
+        try:
+            yield
+        finally:
+            self._decrement_ignore_depth()
+
+    def _on_key_press(self, key):
+        if not self.enabled:
+            return
+        with self._lock:
+            if not self.active or self._ignore_depth > 0:
+                return
+            self._interrupted = True
+            if key == Key.enter:
+                self._enter_pressed = True
+
+    def _on_mouse_click(self, _x, _y, _button, pressed):
+        if not pressed:
+            return
+        if not self.enabled:
+            return
+        with self._lock:
+            if not self.active or self._ignore_depth > 0:
+                return
+            self._interrupted = True
+
+    def _increment_ignore_depth(self):
+        with self._lock:
+            self._ignore_depth += 1
+
+    def _decrement_ignore_depth(self):
+        with self._lock:
+            self._ignore_depth = max(0, self._ignore_depth - 1)
 
 
 # ===== WINDOW MANAGEMENT =====
@@ -570,20 +702,39 @@ def show_notification(title, message):
 class VoiceWakeupApp:
     """Главный класс приложения."""
 
-    def __init__(self, hotkey=None, wake_word="джарвис", release_word="погнали"):
+    def __init__(
+        self,
+        hotkey=None,
+        wake_word="джарвис",
+        submit_word="погнали",
+        save_to_buffer=True,
+        guard_user_input=True,
+        cursor_voice_input=False,
+    ):
         self.state = AppState.IDLE
         self.is_running = False
         self.thread = None
 
-        self.wake_word = wake_word.lower()
-        self.release_word = release_word.lower()
+        self.wake_word = wake_word.lower().strip()
+        self.submit_word = submit_word.lower().strip()
+        self.cursor_voice_input = bool(cursor_voice_input)
+        self.clipboard = ClipboardManager(enabled=save_to_buffer)
+        self.user_monitor = UserActivityMonitor(enabled=guard_user_input)
 
         self.audio_processor = AudioProcessor()
         self.speech_detector = None
         self.window_manager = WindowManager()
-        self.key_simulator = KeySimulator(custom_combo=hotkey)
+        self.key_simulator = KeySimulator(combo_text=hotkey)
+        self.keyboard = Controller()
+        self.current_message_tokens = []
+        self._typing_enabled = True
 
-        logger.info(f"Voice Wakeup Cursor initialized (wake: '{self.wake_word}', release: '{self.release_word}')")
+        logger.info(
+            "Voice Wakeup Cursor initialized (wake='%s', submit='%s', cursor_voice=%s)",
+            self.wake_word,
+            self.submit_word,
+            self.cursor_voice_input,
+        )
 
     def initialize_speech_detector(self, model_path=None):
         """Initialize speech detector with model path resolution and download."""
@@ -626,19 +777,23 @@ class VoiceWakeupApp:
         self.speech_detector = SpeechDetector(model_path=model_path)
         logger.info("Speech detector initialized")
 
+    @staticmethod
+    def _normalize_word(text):
+        return text.strip().strip(".,!?\"'").lower()
+
     def check_wake_word(self, text):
         """Check if text contains wake word."""
         if not text:
             return False
-        text_lower = text.lower().strip()
-        return self.wake_word in text_lower or text_lower == self.wake_word
+        normalized_tokens = [self._normalize_word(part) for part in text.split()]
+        return self.wake_word in normalized_tokens
 
-    def check_release_word(self, text):
-        """Check if text contains release word."""
+    def check_submit_word(self, text):
+        """Check if text contains submit word."""
         if not text:
             return False
-        text_lower = text.lower().strip()
-        return self.release_word in text_lower or text_lower == self.release_word
+        normalized_tokens = [self._normalize_word(part) for part in text.split()]
+        return self.submit_word in normalized_tokens
 
     def start(self):
         if self.is_running:
@@ -650,6 +805,7 @@ class VoiceWakeupApp:
                 self.initialize_speech_detector()
 
             self.audio_processor.start()
+            self.user_monitor.start()
 
             self.is_running = True
             self.thread = threading.Thread(target=self._main_loop, daemon=True)
@@ -659,7 +815,7 @@ class VoiceWakeupApp:
             logger.info("Application started")
 
             show_notification("Приложение запущено", f"Ожидание wake word: '{self.wake_word}'")
-            logger.info("Используемая горячая клавиша: %s", self.key_simulator.get_key_combination())
+            logger.info("Используемая горячая клавиша: %s", self.key_simulator.get_key_display())
 
         except Exception:
             logger.error("Failed to start application", exc_info=True)
@@ -671,10 +827,9 @@ class VoiceWakeupApp:
 
         self.is_running = False
 
-        if self.state == AppState.PUSHED:
-            self.key_simulator.release_push_to_talk()
-
+        self.user_monitor.end_session()
         self.audio_processor.stop()
+        self.user_monitor.shutdown()
 
         self.state = AppState.IDLE
         logger.info("Application stopped")
@@ -713,53 +868,18 @@ class VoiceWakeupApp:
         if not text:
             return
 
+        tokens = [token.strip() for token in text.split() if token.strip()]
+        if not tokens:
+            return
+
         if self.state == AppState.IDLE:
             if self.check_wake_word(text):
-                logger.info(f"Wake word detected: {text}")
-                self._activate_voice_mode()
-
-        elif self.state == AppState.PUSHED:
-            if self.check_release_word(text):
-                logger.info(f"Release word detected: {text}")
-                self._deactivate_voice_mode()
-
-    def _activate_voice_mode(self):
-        try:
-            logger.info("Attempting to focus Cursor window...")
-            if not self.window_manager.focus_cursor_window():
-                logger.warning("Failed to focus Cursor window")
-                show_notification("Ошибка", "Не удалось найти окно Cursor IDE")
-                return
-
-            # Give window manager more time to actually bring window to foreground and settle
-            logger.debug("Waiting for window to come into focus and settle...")
-            time.sleep(0.8)
-
-            logger.info("Pressing push-to-talk hotkey...")
-            self.key_simulator.press_select_chat_input()
-            self.state = AppState.PUSHED
-
-            logger.info("Voice mode activated")
-            show_notification("Голосовой режим активирован", f"Скажите '{self.release_word}' для завершения")
-
-        except Exception as e:
-            logger.error(f"Error activating voice mode: {e}")
-            self.state = AppState.IDLE
-
-    def _deactivate_voice_mode(self):
-        try:
-            self.key_simulator.release_push_to_talk()
-            self.state = AppState.IDLE
-
-            logger.info("Voice mode deactivated")
-            show_notification("Голосовой режим деактивирован", f"Ожидание wake word: '{self.wake_word}'")
-
-        except Exception as e:
-            logger.error(f"Error deactivating voice mode: {e}")
-            self.state = AppState.IDLE
-
-    def _process_state(self):
-        pass
+                logger.info("Wake word detected: %s", text)
+                if self._start_session():
+                    start_index = self._find_word_index(tokens, self.wake_word)
+                    self._consume_tokens(tokens[start_index:])
+        elif self.state == AppState.CAPTURING:
+            self._consume_tokens(tokens)
 
     def run(self):
         try:
@@ -769,13 +889,143 @@ class VoiceWakeupApp:
             logger.info("Keyboard interrupt received")
             self.quit()
 
+    def _start_session(self):
+        if not self._prepare_chat_input():
+            logger.warning("Не удалось подготовить окно Cursor")
+            return False
+        self.current_message_tokens = []
+        self._typing_enabled = not self.cursor_voice_input
+        self.state = AppState.CAPTURING
+        self.user_monitor.begin_session()
+        show_notification("Голосовой режим активирован", f"Скажите '{self.submit_word}' для завершения")
+        logger.info("Начали новую голосовую сессию")
+        return True
+
+    def _prepare_chat_input(self):
+        try:
+            logger.info("Фокусируем окно Cursor...")
+            if not self.window_manager.focus_cursor_window():
+                show_notification("Ошибка", "Не удалось найти окно Cursor IDE")
+                return False
+
+            time.sleep(0.4)
+            if self.cursor_voice_input:
+                logger.info("Запускаем Cursor Voice Input")
+                self.key_simulator.tap(times=1)
+            else:
+                logger.info("Двойное нажатие горячей клавиши для фокуса чата")
+                self.key_simulator.tap(times=1)
+                time.sleep(0.25)
+                self.key_simulator.tap(times=1)
+            time.sleep(0.1)
+            return True
+        except Exception as err:
+            logger.error("Не удалось нажать горячую клавишу: %s", err)
+            return False
+
+    def _consume_tokens(self, tokens):
+        if not tokens:
+            return
+        if self._handle_user_enter():
+            return
+
+        if self._typing_enabled and self.user_monitor.was_interrupted:
+            self._typing_enabled = False
+            logger.info("Пользователь вмешался, автоматическая печать отключена")
+
+        for token in tokens:
+            is_submit_word = self.check_submit_word(token)
+            self._append_word(token, is_submit_word=is_submit_word)
+
+            if is_submit_word:
+                logger.info("Submit word detected: %s", token)
+                self._finalize_session(reason="submit-word")
+                break
+
+            if self._handle_user_enter():
+                break
+
+    def _handle_user_enter(self):
+        if self.user_monitor.consume_enter_pressed():
+            logger.info("Пользователь нажал Enter, завершаем ввод")
+            self._finalize_session(reason="user-enter")
+            return True
+        return False
+
+    def _append_word(self, token, is_submit_word=False):
+        cleaned = token.strip()
+        if not cleaned:
+            return
+        self.current_message_tokens.append(cleaned)
+
+        if self._should_type():
+            suffix = "" if is_submit_word else " "
+            self._type_text(cleaned + suffix)
+
+    def _should_type(self):
+        return self._typing_enabled and not self.cursor_voice_input
+
+    def _type_text(self, text):
+        if not text:
+            return
+        with self.user_monitor.simulated_input():
+            for char in text:
+                self.keyboard.press(char)
+                self.keyboard.release(char)
+                time.sleep(0.01)
+
+    def _press_enter(self):
+        with self.user_monitor.simulated_input():
+            self.keyboard.press(Key.enter)
+            self.keyboard.release(Key.enter)
+            time.sleep(0.05)
+
+    def _finalize_session(self, reason):
+        message = " ".join(self.current_message_tokens).strip()
+        if message:
+            logger.info("Фраза завершена (%s): %s", reason, message)
+            self.clipboard.save(message)
+        else:
+            logger.info("Сессия завершена без текста (%s)", reason)
+
+        if self.cursor_voice_input:
+            try:
+                logger.info("Отключаем Cursor Voice Input")
+                self.key_simulator.tap(times=1)
+            except Exception as err:
+                logger.warning("Не удалось отключить Cursor Voice Input: %s", err)
+
+        if self._should_press_enter(reason):
+            self._press_enter()
+
+        self.user_monitor.end_session()
+        self.current_message_tokens = []
+        self.state = AppState.IDLE
+        self._typing_enabled = True
+        show_notification("Голосовой режим деактивирован", f"Ожидание wake word: '{self.wake_word}'")
+
+    def _should_press_enter(self, reason):
+        if reason == "user-enter":
+            return False
+        if self.user_monitor.was_interrupted:
+            return False
+        if self.cursor_voice_input:
+            return True
+        return self._typing_enabled
+
+    def _find_word_index(self, tokens, target):
+        for idx, token in enumerate(tokens):
+            if self._normalize_word(token) == target:
+                return idx
+        return 0
+
 
 # ===== MAIN ENTRY POINT =====
 def parse_args():
     parser = argparse.ArgumentParser(description="Voice Wakeup Cursor - hands-free управление Voice Mode")
     parser.add_argument(
         "--hotkey",
-        help="Комбинация для push-to-talk, например 'ctrl+shift+space'",
+        help="Комбинация для push-to-talk в формате HotKey.parse, например '<ctrl>+<shift>+space'",
     )
     parser.add_argument(
         "--wake-word",
@@ -783,16 +1033,41 @@ def parse_args():
         help="Слово для активации Cursor IDE (по умолчанию: 'джарвис')",
     )
     parser.add_argument(
-        "--release-word",
+        "--submit-word",
         default="погнали",
         help="Слово для отправки промпта (по умолчанию: 'погнали')",
+    )
+    parser.add_argument(
+        "--save-to-buffer",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Сохранять последнее сообщение в буфер обмена (по умолчанию: включено)",
+    )
+    parser.add_argument(
+        "--user-interrupt-guard",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Останавливать автопечать при действиях пользователя (по умолчанию: включено)",
+    )
+    parser.add_argument(
+        "--cursor-voice-input",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Использовать встроенный Cursor Voice Input вместо печати (по умолчанию: выключено)",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    app = VoiceWakeupApp(hotkey=args.hotkey, wake_word=args.wake_word, release_word=args.release_word)
+    app = VoiceWakeupApp(
+        hotkey=args.hotkey,
+        wake_word=args.wake_word,
+        submit_word=args.submit_word,
+        save_to_buffer=args.save_to_buffer,
+        guard_user_input=args.user_interrupt_guard,
+        cursor_voice_input=args.cursor_voice_input,
+    )
 
     app.start()
     app.run()
