@@ -4,20 +4,21 @@ version = "1.0.0"
 description = "Voice-activated hands-free управление Cursor IDE"
 requires-python = ">=3.12"
 dependencies = [
-    "vosk>=0.3.45",
+    "soundfile>=0.12.0",
     "sounddevice>=0.4.6",
     "pystray>=0.19.5",
     "pillow>=10.0.0",
     "psutil>=5.9.0",
     "numpy>=1.24.0",
-    "silero-vad>=6.2.0",
-    "pynput>=1.7.6",
     "pyperclip>=1.8.2",
+    "tqdm>=4.66.0",
+    "onnx-asr[cpu,hub]>=0.10.0",
+    "pynput>=1.7.6",
 ]
 
 [project.scripts]
-freehands-cursor = "freehands_cursor.__init__:main"
-jarvis = "freehands_cursor.__init__:main"
+freehands-cursor = "freehands_cursor.__main__:main"
+jarvis = "freehands_cursor.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

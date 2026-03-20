@@ -1,121 +1,107 @@
 # Freehands Cursor
 
-Standalone Python приложение для голосового управления Cursor IDE.
+Standalone Python application for voice control of Cursor IDE.
 
-## Возможности
+## Features
 
-- 🎤 Непрерывное прослушивание микрофона на русском языке
-- 🔔 Активация Voice Mode в Cursor по wake word "Джарвис"
-- ⌨️ Автоматическое двойное "нажатие" push-to-talk (Cmd+Space / Ctrl+Shift+Space) для фокуса на чате Cursor, комбинация задаётся через CLI
-- ✍️ Автопечать всей услышанной фразы (включая слова активации и отправки) с автоматической отправкой Enter
-- 🪟 Автоматический фокус на окно Cursor IDE
-- 🛑 Submit word "Погнали" завершает ввод и отправляет сообщение
-- 🖥️ Системный трей с управлением
-- 🔔 Системные уведомления о статусе
+- 🎤 Continuous microphone listening in Russian
+- 🔔 Voice Mode activation in Cursor via wake word "Джарвис"
+- ⌨️ Automatic double "press" of push-to-talk (Cmd+Space / Ctrl+Shift+Space) to focus on Cursor chat, combination is set via CLI
+- 📝 Audio accumulation after wake word and recognition as a single chunk
+- ✍️ Auto-typing of recognized text in full
+- 🪟 Automatic focus on Cursor IDE window
+- 🛑 Submit word "Погнали" completes accumulation and starts recognition
+- ⏱️ Automatic recognition after 3-second pause
+- ⌨️ Pressing Enter also starts recognition
+- 🔔 System notifications about status
 
-## Требования
+## Requirements
 
-Приложение использует [Vosk](https://alphacephei.com/vosk/) для офлайн распознавания речи. Vosk не требует интернет-соединения или внешнего сервера.
+The application uses [ONNX ASR](https://github.com/alphacep/onnx-asr) for offline speech recognition with VAD (Voice Activity Detection). Models are automatically downloaded on first use via Hugging Face Hub.
 
-### Установка модели Vosk
+### Recognition Model
 
-Перед первым использованием необходимо скачать русскую модель Vosk:
+By default, the model `alphacep/vosk-model-ru` is used. The model is downloaded automatically on first run and cached locally.
+
+You can specify a different model via the `--model-name` parameter:
 
 ```bash
-# Создать директорию для модели
-mkdir -p ~/.freehands_cursor
-
-# Скачать русскую модель (рекомендуется модель среднего размера)
-cd ~/.freehands_cursor
-wget https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip
-unzip vosk-model-ru-0.42.zip
-mv vosk-model-ru-0.42 vosk-model-ru
-
-# Или использовать более точную большую модель
-# wget https://alphacephei.com/vosk/models/vosk-model-ru-0.42-large.zip
-# unzip vosk-model-ru-0.42-large.zip
-# mv vosk-model-ru-0.42-large vosk-model-ru
+uvx freehands-cursor --model-name "alphacep/vosk-model-ru"
 ```
 
-**Примечание:** Приложение автоматически использует модель из `~/.freehands_cursor/vosk-model-ru`. Вы можете указать другой путь через переменную окружения `VOSK_MODEL_PATH`.
+## Installation
 
-Доступные модели можно найти на [странице моделей Vosk](https://alphacephei.com/vosk/models).
-
-## Установка
-
-### Через uvx (рекомендуется для пользователей)
+### Via uvx (recommended for users)
 
 ```bash
-# Установить uv если еще не установлен
+# Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Запустить приложение (автоматически установит зависимости)
+# Run application (will automatically install dependencies)
 uvx freehands-cursor
 
-# С кастомной горячей клавишей
+# With custom hotkey
 uvx freehands-cursor --hotkey ctrl+shift+space
 
-# С кастомным путем к модели Vosk
-VOSK_MODEL_PATH=/path/to/vosk-model-ru uvx freehands-cursor
+# With custom model
+uvx freehands-cursor --model-name "alphacep/vosk-model-ru"
 ```
 
-**Примечание:** При первом запуске `uvx` автоматически установит все зависимости. Убедитесь, что модель Vosk установлена перед использованием приложения.
+**Note:** On first run, `uvx` will automatically install all dependencies. The recognition model will be downloaded automatically on first use.
 
-## Использование
+## Usage
 
-### Запуск приложения
+### Running the Application
 
-После установки приложение можно запускать через команду `jarvis` (или `uvx freehands-cursor`):
+After installation, you can run the application via the command `jarvis` (or `uvx freehands-cursor`):
 
 ```bash
-# Стандартный запуск
+# Standard run
 jarvis
 
-# С кастомной горячей клавишей
+# With custom hotkey
 jarvis --hotkey ctrl+shift+space
 ```
 
-Приложение запустится в системном трее. Используйте меню трея для управления:
-- **Запустить** - Начать прослушивание
-- **Остановить** - Остановить прослушивание
-- **Выход** - Закрыть приложение
+The application starts and immediately begins listening to the microphone.
 
-### Работа с приложением
+### Working with the Application
 
-1. Запустите приложение и нажмите "Запустить" в трее
-2. Скажите "Джарвис" — окно Cursor получит фокус, приложение дважды «кликнет» горячую клавишу голосового ввода и активирует поле чата
-3. Продиктуйте запрос — слова активации, текст и submit word будут напечатаны в чат и одновременно сохранены в буфер обмена (по умолчанию)
-4. Скажите "Погнали" — слово также будет напечатано, после чего приложение нажмёт Enter (или прекратит ввод, если Enter нажали вы)
+1. Start the application
+2. Say "Джарвис" — the Cursor window gets focus, the application double-clicks the voice input hotkey and activates the chat field
+3. Dictate your request — audio accumulates in the buffer without recognition
+4. Complete the input in one of the ways:
+   - Say "Погнали" — recognition of all accumulated audio starts
+   - Press Enter — recognition of all accumulated audio starts
+   - Wait 3 seconds of pause — recognition starts automatically
+5. During recognition, "..." is shown, then all recognized text is inserted in one piece
+6. When using submit word "Погнали", the application automatically presses Enter to send the message
 
-Если вы начинаете печатать/кликать вручную между wake и submit словами, автопечать сразу отключается, но распознавание продолжится — сессия завершится по вашему Enter или submit word.
+**Features:**
+- Audio accumulates without recognition until input completion
+- Recognition is performed in one piece for all accumulated audio
+- If you start typing/clicking manually, auto-typing is disabled, but accumulation continues
 
-## Настройка
+## Configuration
 
-### Модель Vosk
+### Recognition Model
 
-По умолчанию приложение использует модель из `~/.freehands_cursor/vosk-model-ru`. Вы можете указать другой путь через переменную окружения:
+By default, the application uses the model `alphacep/vosk-model-ru`. You can specify a different model via the `--model-name` parameter:
 
 ```bash
-# Указать другой путь к модели
-export VOSK_MODEL_PATH=/path/to/vosk-model-ru
-uvx freehands-cursor
-
-# Или указать при запуске
-VOSK_MODEL_PATH=/path/to/vosk-model-ru uvx freehands-cursor
+# Use another model
+uvx freehands-cursor --model-name "alphacep/vosk-model-ru"
 ```
 
-**Рекомендации по выбору модели:**
-- `vosk-model-ru-0.42` - быстрая модель среднего размера (~1.5GB), хорошая точность
-- `vosk-model-ru-0.42-large` - более точная модель большого размера (~1.8GB), требует больше памяти
-- Для лучшей производительности используйте модель среднего размера
+Models are automatically downloaded via Hugging Face Hub and cached locally.
 
-### Кастомная горячая клавиша
+### Custom Hotkey
 
-По умолчанию используются следующие комбинации:
+By default, the following combinations are used:
 - **Windows/Linux**: Ctrl+Shift+Space
 - **macOS**: Cmd+Space
 
-Комбинация задаётся в формате `HotKey.parse`, то есть специальные клавиши нужно оборачивать в угловые скобки:
+The combination is specified in the format `HotKey.parse`, i.e., special keys must be wrapped in angle brackets:
 
 ```bash
 jarvis --hotkey "<ctrl>+<shift>+space"
@@ -123,135 +109,144 @@ jarvis --hotkey "<alt>+<space>"
 jarvis --hotkey "<shift>+f1"
 ```
 
-### Дополнительные параметры запуска
+### Additional Startup Parameters
 
-- `--save-to-buffer/--no-save-to-buffer` — включить/выключить автоматическое копирование последнего сообщения в буфер обмена (по умолчанию включено)
-- `--user-interrupt-guard/--no-user-interrupt-guard` — останавливать автопечать при любых действиях пользователя в Cursor (клавиатура/мышь) и завершать сессию по вашему Enter (по умолчанию включено)
-- `--cursor-voice-input/--no-cursor-voice-input` — использовать встроенный Cursor Voice Input вместо печати текстом. При активации приложение один раз нажимает горячую клавишу голосового ввода и даёт Cursor самому распознавать речь, а отправку по-прежнему можно завершить вашим submit словом. Учтите, что сам Cursor поддерживает только английское submit keyword `submit` и не понимает русский вариант — это ограничение IDE.
+- `--wake-word` — activation word (default: "джарвис")
+- `--submit-word` — word to complete input and start recognition (default: "погнали")
+- `--save-to-buffer/--no-save-to-buffer` — enable/disable automatic copying of the last message to clipboard (default: enabled)
+- `--model-name` — ONNX ASR model name from Hugging Face Hub (default: "alphacep/vosk-model-ru")
 
-## Устранение неполадок
+## Troubleshooting
 
-### Микрофон не работает
+### Microphone Not Working
 
-- Проверьте разрешения на доступ к микрофону в настройках ОС
-- Убедитесь, что микрофон подключен и работает
+- Check microphone access permissions in OS settings
+- Ensure microphone is connected and working
 
-### Cursor не находится
+### Cursor Not Found
 
-- Убедитесь, что Cursor IDE запущен
-- Проверьте, что название процесса содержит "cursor"
+- Ensure Cursor IDE is running
+- Check that the process name contains "cursor"
 
-### Клавиши не нажимаются
+### Keys Not Being Pressed
 
-- Убедитесь, что приложение имеет права на эмуляцию клавиатуры
-- На Linux необходимо наличие `xdotool` (устанавливается автоматически с зависимостями)
-- Попробуйте задать другое сочетание клавиш: `jarvis --hotkey alt+space`
+- Ensure the application has keyboard emulation rights
+- On Linux, `ydotool` is required (installed separately)
+- Ensure `ydotool` is running: `ydotool daemon` (may require sudo)
+- Try a different key combination: `jarvis --hotkey alt+space`
 
-### Модель Vosk не найдена
+### Model Not Loading
 
-- Убедитесь, что модель Vosk установлена в `~/.freehands_cursor/vosk-model-ru`
-- Проверьте путь в переменной окружения `VOSK_MODEL_PATH`
-- Убедитесь, что модель распакована правильно (должна содержать файлы `am`, `graph`, `conf/mfcc.conf` и т.д.)
-- Проверьте логи приложения в `~/.freehands_cursor/freehands_cursor.log`
+- Check internet connection (model is downloaded via Hugging Face Hub on first run)
+- Ensure the specified model name exists in Hugging Face Hub
+- Check application logs in `~/.freehands_cursor/freehands_cursor.log`
+- Model is cached locally, subsequent runs don't require internet
 
-### Ошибки при установке на Linux
+### Installation Errors on Linux
 
-Если при установке возникают ошибки компиляции, установите системные зависимости:
+If compilation errors occur during installation, install system dependencies:
 
 **Fedora/RHEL/CentOS:**
 ```bash
-sudo dnf install python3-devel portaudio-devel xdotool
+sudo dnf install python3-devel portaudio-devel ydotool
 ```
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt-get install python3-dev portaudio19-dev xdotool
+sudo apt-get install python3-dev portaudio19-dev ydotool
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S python portaudio xdotool
+sudo pacman -S python portaudio ydotool
 ```
 
 **openSUSE:**
 ```bash
-sudo zypper install python3-devel portaudio-devel xdotool
+sudo zypper install python3-devel portaudio-devel ydotool
 ```
 
-## Логи
+**Note:** After installing `ydotool`, you may need to start the daemon:
+```bash
+sudo ydotool daemon
+```
 
-Логи сохраняются в `~/.freehands_cursor/freehands_cursor.log`
+## Logs
+
+Logs are saved to `~/.freehands_cursor/freehands_cursor.log`
 
 ---
 
-## Для разработчиков
+## For Developers
 
-### Установка для разработки
+### Development Installation
 
 ```bash
-# Клонировать репозиторий
+# Clone repository
 git clone <repository-url>
 cd freehands-cursor
 
-# Установить uv если еще не установлен
+# Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Синхронизировать зависимости из pyproject.toml
-uv sync
+# Install package in editable mode (for development)
+uv pip install -e .[dev]
 
-# (опционально) Активировать виртуальное окружение uv
-source .venv/bin/activate  # bash/zsh
-
-# Запустить приложение
+# Run application
 uv run jarvis
 ```
 
-### Зависимости
+### Dependencies
 
-- `vosk>=0.3.45` - Офлайн распознавание речи
-- `pyautogui>=0.9.54` - Автоматизация GUI
-- `sounddevice>=0.4.6` - Захват аудио
-- `pystray>=0.19.5` - Системный трей
-- `pillow>=10.0.0` - Обработка изображений для иконки
-- `psutil>=5.9.0` - Управление процессами
-- `numpy>=1.24.0` - Численные вычисления
+- `onnx-asr` - Offline speech recognition with VAD
+- `sounddevice>=0.4.6` - Audio capture
+- `psutil>=5.9.0` - Process management
+- `ydotool` - Keyboard automation on Linux (system dependency)
+- `numpy>=1.24.0` - Numerical computations
 
-### Технологии
+### Technologies
 
-Приложение использует:
-- **[Vosk](https://alphacephei.com/vosk/)** - Офлайн распознавание речи на базе Kaldi
-- Полностью офлайн работа, не требует интернет-соединения
-- Низкая задержка распознавания
+The application uses:
+- **[ONNX ASR](https://github.com/alphacep/onnx-asr)** - ONNX-based offline speech recognition with VAD support
+- Models are loaded via Hugging Face Hub and cached locally
+- Works completely offline after first load
+- Low recognition latency due to batch processing
 
-### Настройка модели Vosk
+### Model Configuration
 
-Для изменения пути к модели, измените в `freehands_cursor/main.py`:
+To change the recognition model, use the `--model-name` parameter:
 
-```python
-# Использовать другой путь к модели
-app.initialize_speech_detector(model_path="/path/to/vosk-model-ru")
-
-# Или через переменные окружения
-import os
-os.environ["VOSK_MODEL_PATH"] = "/path/to/vosk-model-ru"
+```bash
+uvx freehands-cursor --model-name "alphacep/vosk-model-ru"
 ```
 
-### Структура проекта
+Or in code:
+
+```python
+app = VoiceWakeupApp(model_path="alphacep/vosk-model-ru")
+```
+
+### Project Structure
 
 ```
 freehands-cursor/
 ├── freehands_cursor/
-│   ├── __init__.py
-│   ├── main.py              # Главный модуль
-│   ├── audio_processor.py   # Захват аудио
-│   ├── speech_detector.py   # Распознавание речи
-│   ├── window_manager.py    # Управление окнами
-│   ├── key_simulator.py     # Эмуляция клавиш
-│   └── tray_app.py          # Системный трей
+│   └── __init__.py          # Main module (all components in one file)
 ├── pyproject.toml
 └── README.md
 ```
 
-## Лицензия
+### Logic
+
+1. **IDLE mode**: Continuous listening and wake word detection
+2. **ACCUMULATING mode**: After wake word, audio accumulation starts in buffer without recognition
+3. **Recognition triggers**:
+   - Pronouncing submit word
+   - User pressing Enter
+   - 3-second pause
+4. **Recognition**: Entire accumulated buffer is processed in one piece via model
+5. **Text insertion**: "..." is shown during recognition, then entire text is inserted
+
+## License
 
 MIT
