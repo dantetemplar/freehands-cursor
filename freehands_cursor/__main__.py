@@ -2,25 +2,25 @@
 Voice Wakeup Cursor - hands-free Voice Mode control
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, assert_never
+from typing import TYPE_CHECKING, assert_never
 
 import numpy as np
 import numpy.typing as npt
-import onnx_asr
-import psutil
-import sounddevice as sd
-from onnx_asr.utils import SampleRates
 
-from freehands_cursor.keyboard_operations import KeyboardBackend, copy_paste, press_hotkey, press_hotkey_twice
+from freehands_cursor.keyboard_operations import KeyboardBackend, press_hotkey
 
 # ===== CONFIG =====
 APP_HOME_DIR = Path.home() / ".freehands_cursor"
@@ -30,8 +30,59 @@ LOG_FILE = APP_HOME_DIR / "freehands_cursor.log"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHUNK_SIZE = 4096
 
+
+# Describes the current display/server environment for platform-specific hotkeys/focusing.
+class Environment(StrEnum):
+    X11 = "x11"
+    GNOME_WAYLAND = "gnome+wayland"
+    UNKNOWN_WAYLAND = "unknown-wayland"
+    WINDOWS = "windows"
+    MACOS = "macos"
+
+
+def _detect_environment() -> Environment:
+    if sys.platform.startswith("win"):
+        return Environment.WINDOWS
+    if sys.platform == "darwin":
+        return Environment.MACOS
+
+    xdg_session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    wayland_display = os.environ.get("WAYLAND_DISPLAY")
+    x_display = os.environ.get("DISPLAY")
+
+    xdg_current_desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    desktop_session = os.environ.get("DESKTOP_SESSION", "").upper()
+
+    is_gnome = ("GNOME" in xdg_current_desktop) or ("GNOME" in desktop_session)
+
+    # Prefer explicit session type if available.
+    if xdg_session_type == "x11":
+        return Environment.X11
+    if xdg_session_type == "wayland":
+        return Environment.GNOME_WAYLAND if is_gnome else Environment.UNKNOWN_WAYLAND
+
+    # Fallback to environment variables.
+    if wayland_display:
+        return Environment.GNOME_WAYLAND if is_gnome else Environment.UNKNOWN_WAYLAND
+    if x_display:
+        return Environment.X11
+
+    # Last resort: treat as an unknown non-X11 graphical environment.
+    return Environment.UNKNOWN_WAYLAND
+
+
+ENVIRONMENT: Environment = _detect_environment()
+
+# GNOME Wayland: extension sort-order needs to be set only once per script run.
+# Keep as mutable container to avoid `global` assignment inside functions.
+_GNOME_WAYLAND_SORT_ORDER_SET_ONCE = {"value": False}
+
 # ONNX ASR model configuration
 DEFAULT_MODEL_NAME = "alphacep/vosk-model-small-ru"
+
+if TYPE_CHECKING:
+    # Only needed for static typing; imported lazily at runtime when voice mode starts.
+    from onnx_asr.utils import SampleRates
 
 
 # ===== LOGGING =====
@@ -74,8 +125,13 @@ class SpeechDetector:
         sample_rate: SampleRates = DEFAULT_SAMPLE_RATE,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ):
+        # Import heavy/optional runtime dependency only when voice mode is used.
+        import onnx_asr
+        import sounddevice as sd
+
         self.sample_rate: SampleRates = sample_rate
         self.chunk_size = chunk_size
+        self._sd = sd
 
         logger.info(f"Loading ONNX ASR model '{model_name}' from Hugging Face...")
         try:
@@ -91,7 +147,7 @@ class SpeechDetector:
         # Audio capture
         self.audio_queue: queue.Queue[npt.NDArray[np.float32]] = queue.Queue()
         self.is_recording: bool = False
-        self.stream: sd.InputStream | None = None
+        self.stream = None
 
         # Wake word detection buffer (sliding window)
         self.wake_buffer: list[npt.NDArray[np.float32]] = []
@@ -100,8 +156,9 @@ class SpeechDetector:
         self.wake_buffer_overlap_duration: float = 0.5  # Keep 0.5 seconds overlap between windows
         self.wake_buffer_overlap_samples: int = int(self.sample_rate * self.wake_buffer_overlap_duration)
 
-        # Session buffer (accumulates audio from wake word to submit word)
-        self.session_buffer: list[npt.NDArray[np.float32]] = []
+        # Session buffer (accumulates audio only when we explicitly capture a command).
+        # Keep it disabled by default so wake-word listening doesn't grow memory.
+        self.session_buffer: list[npt.NDArray[np.float32]] | None = None
 
     # ===== AUDIO CAPTURE =====
     def _audio_callback(self, indata, frames, time, status):
@@ -119,7 +176,7 @@ class SpeechDetector:
         """Start audio capture from microphone."""
         if self.is_recording:
             return
-        self.stream = sd.InputStream(
+        self.stream = self._sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
@@ -155,7 +212,7 @@ class SpeechDetector:
 
     def session_finished(self):
         """Finish the session, clearing the session buffer."""
-        self.session_buffer = []
+        self.session_buffer = None
         self.wake_buffer = []
 
     # ===== SPEECH RECOGNITION =====
@@ -221,7 +278,7 @@ class SpeechDetector:
 
     def transcribe_session_buffer(self) -> str | None:
         """Transcribe the session buffer and return recognized text if available."""
-        if not self.session_buffer:
+        if self.session_buffer is None or not self.session_buffer:
             return None
 
         try:
@@ -250,51 +307,140 @@ class SpeechDetector:
 # ===== WINDOW FOCUS =====
 def focus_window_flow(name: str) -> bool:
     """Find and focus window. Returns True if successful, False otherwise."""
-    window = None
-
-    # Try wmctrl first
-    try:
-        result = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                if name.lower() in line.lower():
-                    window_id = line.split()[0]
-                    window = window_id
-                    logger.info(f"Found {name} window via wmctrl: {window_id}")
-                    break
-    except Exception as e:
-        logger.debug(f"wmctrl not available or error: {e}")
-
-    # Fallback to process search
-    if not window:
+    # Try to focus window using pywinctl for Windows and X11
+    if ENVIRONMENT == Environment.WINDOWS or ENVIRONMENT == Environment.X11 or ENVIRONMENT == Environment.MACOS:
         try:
-            for proc in psutil.process_iter(["pid", "name", "exe"]):
-                try:
-                    name = proc.info["name"] or ""
-                    exe = proc.info["exe"] or ""
-                    if name.lower() in name.lower() or name.lower() in exe.lower():
-                        logger.info(f"Found Cursor process: {proc.info['pid']}")
-                        break
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+            import pywinctl as pwc
+
+            # Find windows containing specific text in title
+            windows = pwc.getWindowsWithTitle(name, condition=pwc.Re.CONTAINS, flags=re.IGNORECASE)
+            logger.info(f"Found {len(windows)} windows with title {name} using pywinctl")
+
+            # Activate the first matching window
+            if windows:
+                windows[0].activate(True)
+                logger.info(f"Activated {name} window using pywinctl")
+                return True
         except Exception as e:
-            logger.error(f"Error finding {name} process: {e}")
+            logger.warning(f"pywinctl not available or error: {e}", exc_info=True)
 
-    if not window:
-        logger.warning(f"{name} window not found")
-        return False
+    # Try to focus window using wmctrl for X11
+    if ENVIRONMENT == Environment.X11:
 
-    # Use wmctrl to focus window
-    try:
-        # First raise the window
-        subprocess.run(["wmctrl", "-ia", str(window)], capture_output=True, text=True, check=False, timeout=2)
-        # Then activate it
-        subprocess.run(["wmctrl", "-iR", str(window)], capture_output=True, text=True, check=False, timeout=2)
-        logger.info(f"Focused {name} window using wmctrl")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to focus {name} window: {e}")
-        return False
+        def focus_window_with_wmctrl(window_id: str) -> bool:
+            try:
+                # Activate window
+                subprocess.run(
+                    ["wmctrl", "-ia", str(window_id)], capture_output=False, text=True, check=True, timeout=2
+                )
+                # Raise window
+                subprocess.run(
+                    ["wmctrl", "-iR", str(window_id)], capture_output=False, text=True, check=True, timeout=2
+                )
+                logger.info(f"Focused {name} window using wmctrl")
+                return True
+            except Exception as e:
+                logger.warning(f"wmctrl not available or error: {e}", exc_info=True)
+                return False
+
+        try:
+            result = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if name.lower() in line.lower():
+                        window_id = line.split()[0]
+                        logger.info(f"Found {name} window via wmctrl: {window_id}")
+                        return focus_window_with_wmctrl(window_id)
+
+        except Exception as e:
+            logger.warning(f"wmctrl not available or error: {e}", exc_info=True)
+
+    # Try to focus window via Gnome Extensions
+    if ENVIRONMENT == Environment.GNOME_WAYLAND:
+        # Uses the GNOME Shell extension described in README:
+        # - activateBySubstring: focuses window by substring in title
+        # - setSortOrder(highest_user_time): always prefer the most recently used match
+        try:
+            if not _GNOME_WAYLAND_SORT_ORDER_SET_ONCE["value"]:
+                res = subprocess.run(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.gnome.Shell",
+                        "--object-path",
+                        "/de/lucaswerkmeister/ActivateWindowByTitle",
+                        "--method",
+                        "de.lucaswerkmeister.ActivateWindowByTitle.setSortOrder",
+                        "highest_user_time",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=3,
+                )
+                if res.returncode == 0:
+                    logger.debug("GNOME extension sort order set to highest_user_time")
+                else:
+                    logger.debug(
+                        "GNOME extension setSortOrder failed (rc=%s): %s",
+                        res.returncode,
+                        (res.stderr or res.stdout or "").strip(),
+                    )
+                _GNOME_WAYLAND_SORT_ORDER_SET_ONCE["value"] = True
+
+            res = subprocess.run(
+                [
+                    "gdbus",
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.gnome.Shell",
+                    "--object-path",
+                    "/de/lucaswerkmeister/ActivateWindowByTitle",
+                    "--method",
+                    "de.lucaswerkmeister.ActivateWindowByTitle.activateBySubstring",
+                    name,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            if res.returncode != 0:
+                logger.debug(
+                    "GNOME extension activateBySubstring failed (rc=%s): %s",
+                    res.returncode,
+                    (res.stderr or res.stdout or "").strip(),
+                )
+            else:
+                out = (res.stdout or "") + (res.stderr or "")
+                out_lower = out.lower()
+                if "false" in out_lower:
+                    success = False
+                elif "true" in out_lower:
+                    success = True
+                else:
+                    # If extension didn't return an explicit boolean, consider it a failure.
+                    # This avoids false-positive "success" when GNOME extension can't find the window.
+                    success = False
+                    logger.debug(
+                        "GNOME extension activateBySubstring returned no boolean (rc=%s). Output: %r",
+                        res.returncode,
+                        out.strip(),
+                    )
+
+                if success:
+                    logger.info("Focused %s window via GNOME extension", name)
+                    return True
+
+        except FileNotFoundError:
+            logger.warning("gdbus not found; GNOME focus via extension is unavailable")
+        except Exception as e:
+            logger.warning("Failed to focus window via GNOME extension: %s", e, exc_info=True)
+
+    return False
 
 
 def normalize_word(text: str) -> str:
@@ -317,16 +463,17 @@ class VoiceWakeupApp:
 
     def __init__(
         self,
-        hotkey: str | None = None,
+        toggle_voice_mode_hotkey: str | None = None,
+        focus_agent_hotkey: str | None = None,
         wake_word: str = "джарвис",
-        submit_word: str = "погнали",
+        submit_keyword: str = "газ",
         model_name: str | None = None,
-        keyboard_backend: KeyboardBackend = KeyboardBackend.YDOTOOL,
+        keyboard_backend: KeyboardBackend | None = None,
     ):
         """
         Args:
-            hotkey: Hotkey for enabling Voice Mode in Cursor and focusing on chat window.
-                   Default: "Ctrl+Shift+Space"
+            hotkey: Cursor hotkey to activate voice mode (default: "Ctrl+Shift+Space").
+                    Format should work with both backends, e.g. "<ctrl>+<shift>+<space>" or "Ctrl+Shift+Space".
         """
         self.state = AppState.IDLE
         self.is_running = False
@@ -334,28 +481,29 @@ class VoiceWakeupApp:
         self._stop_event = threading.Event()
 
         self.wake_word = wake_word.lower().strip()
-        self.submit_word = submit_word.lower().strip()
+        self.submit_keyword = submit_keyword.lower().strip()
         self.model_name = model_name
+        self.toggle_voice_mode_hotkey_str = toggle_voice_mode_hotkey or "Ctrl+Shift+Space"
+        self.focus_agent_hotkey_str = focus_agent_hotkey or "<ctrl>+<shift>+u"
+        self._last_trigger_time = 0.0
+        # Prevent repeated triggers from a single wake-phrase.
+        self._trigger_cooldown_seconds = 1.5
+
+        if keyboard_backend is None:
+            if ENVIRONMENT == Environment.GNOME_WAYLAND or ENVIRONMENT == Environment.UNKNOWN_WAYLAND:
+                keyboard_backend = KeyboardBackend.YDOTOOL
+            else:
+                keyboard_backend = KeyboardBackend.PYNPUT
+
         self.keyboard_backend = keyboard_backend
 
         # Initialize speech detector
         model_name = model_name or DEFAULT_MODEL_NAME
         self.speech_detector = SpeechDetector(model_name=model_name, chunk_size=DEFAULT_CHUNK_SIZE)
-
-        # Hotkey for enabling Voice Mode in Cursor and focusing on chat window
-        self.hotkey_str = hotkey or "Ctrl+Shift+Space"
-
-        # Update timing
-        self.last_update_time = 0  # Timestamp of last transcription update
-        self.update_interval = 2.5  # Update every 2.5 seconds
-        self.current_transcription = ""  # Current transcription text
-
-        logger.info(
-            "Voice Wakeup Cursor initialized (wake='%s', submit='%s')",
-            self.wake_word,
-            self.submit_word,
-        )
-        logger.info("Hotkey combination for Cursor Voice Mode: %s", self.hotkey_str)
+        logger.info("Voice Wakeup Cursor initialized (wake='%s')", self.wake_word)
+        logger.info("Cursor voice hotkey: %s", self.toggle_voice_mode_hotkey_str)
+        logger.info("Submit keyword: %s", self.submit_keyword)
+        logger.info("Cursor Focus Agent hotkey (composer.focusComposer): %s", self.focus_agent_hotkey_str)
 
     def start(self):
         if self.is_running:
@@ -373,7 +521,7 @@ class VoiceWakeupApp:
             logger.info("Application started")
 
             show_notification("Application started", f"Waiting for wake word: '{self.wake_word}'")
-            logger.info("Hotkey used for Cursor Voice Mode: %s", self.hotkey_str)
+            logger.info("Pressing Cursor hotkey on wake word: %s", self.toggle_voice_mode_hotkey_str)
 
         except Exception:
             logger.error("Failed to start application", exc_info=True)
@@ -407,25 +555,35 @@ class VoiceWakeupApp:
 
         while self.is_running:
             try:
-                # In IDLE state, check for wake word and start session if positive
                 if self.state == AppState.IDLE:
                     text = self.speech_detector.transcribe_wake_buffer(timeout=0.5)
 
                     if text and len(text) > 1:  # ignore single character utterances (mostly noise)
                         logger.info(f"[UTTERANCE] {text}")
 
-                    if self.check_wake_word(text):
+                    if self.check_submit_keyword(text):
+                        logger.info("Submit keyword detected: %s", text)
+                        now = time.time()
+                        if now - self._last_trigger_time >= self._trigger_cooldown_seconds:
+                            if self.focus_chat_input_and_submit():
+                                self._last_trigger_time = now
+                            else:
+                                logger.error("Failed to trigger Cursor Focus Agent + submit hotkeys")
+                                show_notification("Submit failed", "Could not trigger Cursor Focus Agent and submit")
+                    elif self.check_wake_word(text):
                         logger.info("Wake word detected: %s", text)
-                        self.start_session()
+                        now = time.time()
+                        if now - self._last_trigger_time >= self._trigger_cooldown_seconds:
+                            if self.focus_cursor_window_and_chat_input():
+                                self._last_trigger_time = now
+                            else:
+                                logger.error("Failed to trigger Cursor hotkey on wake word")
+                                show_notification("Voice mode activation failed", "Could not focus Cursor chat input")
 
-                # In CAPTURING state, check if we need periodic update because
-                #  it will require transcription of the full buffer (demanding operation)
                 elif self.state == AppState.CAPTURING:
-                    current_time = time.time()
-                    if current_time - self.last_update_time >= self.update_interval:
-                        self.transcribe_session_fully()
-                        self.last_update_time = time.time()
-
+                    # Legacy placeholder: CAPTURING is no longer used, but keep the
+                    # branch to satisfy type checking and older state transitions.
+                    self.state = AppState.IDLE
                 else:
                     assert_never(self.state)
 
@@ -442,100 +600,66 @@ class VoiceWakeupApp:
         normalized_tokens = [normalize_word(part) for part in text.split()]
         return self.wake_word in normalized_tokens
 
-    def check_submit_word(self, text):
-        """Check if text contains submit word."""
+    def check_submit_keyword(self, text):
+        """Check if text contains submit keyword."""
         if not text:
             return False
         normalized_tokens = [normalize_word(part) for part in text.split()]
-        return self.submit_word in normalized_tokens
-
-    def start_session(self):
-        if not self.focus_cursor_window_and_chat_input():
-            return False
-        # Reset transcription state and start new session
-        self.current_transcription = ""
-        self.last_update_time = time.time()
-        self.speech_detector.session_started()
-        self.state = AppState.CAPTURING
-        show_notification("Voice mode activated", f"Say '{self.submit_word}' to finish")
-        logger.info("Started new voice session")
-        return True
+        return self.submit_keyword in normalized_tokens
 
     def focus_cursor_window_and_chat_input(self) -> bool:
         try:
             logger.info("Focusing Cursor window...")
-            if not focus_window_flow(name="cursor"):
+            if not focus_window_flow(name="Cursor"):
                 logger.error("Could not find Cursor IDE window")
                 show_notification("Error", "Could not find Cursor IDE window")
                 return False
 
-            if not press_hotkey_twice(self.hotkey_str, backend=self.keyboard_backend):
-                logger.error("Could not focus chat input")
-                show_notification("Error", "Could not focus chat input")
+            if not press_hotkey(self.focus_agent_hotkey_str, backend=self.keyboard_backend):
+                logger.error("Could not press Cursor Focus Agent hotkey before voice mode")
+                show_notification("Error", "Could not press Cursor Focus Agent hotkey")
+                return False
+
+            # Give Cursor a moment to apply focus to the composer before voice mode.
+            time.sleep(0.05)
+            if not press_hotkey(self.toggle_voice_mode_hotkey_str, backend=self.keyboard_backend):
+                logger.error("Could not press Cursor hotkey")
+                show_notification("Error", "Could not press Cursor hotkey")
                 return False
         except Exception as err:
-            logger.error("Failed to press hotkey: %s", err)
+            logger.error("Failed to press Cursor Focus Agent + voice mode hotkeys: %s", err)
             return False
 
         return True
 
-    def transcribe_session_fully(self):
-        """Process the full audio buffer and update the input field."""
+    def focus_chat_input_and_submit(self) -> bool:
         try:
-            # Transcribe session buffer with speech detector
-            transcription = self.speech_detector.transcribe_session_buffer()
+            logger.info("Focusing chat input and submitting...")
+            if not press_hotkey(self.focus_agent_hotkey_str, backend=self.keyboard_backend):
+                logger.error("Could not press Cursor Focus Agent hotkey")
+                show_notification("Error", "Could not press Cursor Focus Agent hotkey")
+                return False
 
-            if transcription:
-                logger.info(f"[FULL TRANSCRIPTION] {transcription}")
-                # Update chat input with new transcription
-                self.update_chat_input(transcription)
+            # Small pause helps ensure composer input is focused before submit.
+            time.sleep(0.05)
+            if not press_hotkey("<enter>", backend=self.keyboard_backend):
+                logger.error("Could not press Enter for submit")
+                show_notification("Error", "Could not press Enter for submit")
+                return False
+        except Exception as err:
+            logger.error("Failed to press Cursor Focus Agent + submit hotkeys: %s", err)
+            return False
 
-                # Check for submit word in transcription and finish session if positive
-                if self.check_submit_word(transcription):
-                    logger.info("Submit word detected in transcription")
-                    self.finish_session(reason="submit-word")
-                    return
-
-        except Exception as e:
-            logger.error(f"Error processing full buffer: {e}", exc_info=True)
-
-    def update_chat_input(self, text: str):
-        """Update the input field by deleting previous text and typing new text."""
-        if not text:
-            return
-
-        # Count characters to delete (current transcription length)
-        delete_prev_chars = len(self.current_transcription)
-        # Delete previous input and set new text
-        copy_paste(delete_prev_chars, text, backend=self.keyboard_backend)
-        self.current_transcription = text
-
-    def finish_session(self, reason: Literal["submit-word"]):
-        # Finish session
-        self.speech_detector.session_finished()
-        message = self.current_transcription.strip()
-        if message:
-            logger.info("Phrase completed (%s): %s", reason, message)
-        else:
-            logger.info("Session ended without text (%s)", reason)
-
-        # Press Enter only on submit-word
-        if reason == "submit-word":
-            press_hotkey("<enter>", backend=self.keyboard_backend)
-
-        # Reset state
-        self.current_transcription = ""
-        self.state = AppState.IDLE
-        show_notification("Voice mode deactivated", f"Waiting for wake word: '{self.wake_word}'")
+        return True
 
 
 # ===== MAIN ENTRY POINT =====
 def main():
     parser = argparse.ArgumentParser(description="Voice Wakeup Cursor - hands-free Voice Mode control")
     parser.add_argument(
-        "--hotkey",
-        help="Hotkey for enabling Voice Mode in Cursor and focusing on chat window. "
-        "Format: 'Ctrl+Shift+Space' (example: 'Ctrl+Shift+Space')",
+        "--toggle-voice-mode-hotkey",
+        default="<ctrl>+<shift>+<space>",
+        help="Hotkey to trigger Cursor voice mode (default: <ctrl>+<shift>+<space>). Note that you should disable When property for composer.toggleVoiceDictation keybind if you want focus chat input from terminal. Format: '<ctrl>+<shift>+a'",
     )
     parser.add_argument(
         "--wake-word",
@@ -543,20 +667,60 @@ def main():
         help="Word to activate Cursor IDE (default: 'джарвис')",
     )
     parser.add_argument(
-        "--submit-word",
-        default="погнали",
-        help="Word to submit prompt (default: 'погнали')",
+        "--submit-keyword",
+        default="газ",
+        help="Word that will submit prompt (presses Enter) (default: 'газ')",
+    )
+    parser.add_argument(
+        "--focus-agent-hotkey",
+        default="<ctrl>+<shift>+y",
+        help="Hotkey for Cursor Focus Agent (command: composer.focusComposer) (default: <ctrl>+<shift>+y)",
     )
     parser.add_argument(
         "--model-name",
         default=None,
         help=f"ONNX ASR model name from Hugging Face (default: {DEFAULT_MODEL_NAME})",
     )
+    parser.add_argument(
+        "--dry-run-focus",
+        action="store_true",
+        help="Only focus the Cursor window and exit. No voice mode starts.",
+    )
+    parser.add_argument(
+        "--dry-run-hotkeys",
+        action="store_true",
+        help="Only press Cursor voice-mode hotkey once and exit. No voice mode starts.",
+    )
     args = parser.parse_args()
+
+    if args.dry_run_focus:
+        success = focus_window_flow("Cursor")
+        logger.info("Dry-run focus completed (success=%s)", success)
+        sys.exit(0 if success else 1)
+    elif args.dry_run_hotkeys:
+        if ENVIRONMENT == Environment.GNOME_WAYLAND or ENVIRONMENT == Environment.UNKNOWN_WAYLAND:
+            keyboard_backend = KeyboardBackend.YDOTOOL
+        else:
+            keyboard_backend = KeyboardBackend.PYNPUT
+
+        focus_agent_success = press_hotkey(args.focus_agent_hotkey, backend=keyboard_backend)
+        toggel_voice_mode_success = press_hotkey(args.toggle_voice_mode_hotkey, backend=keyboard_backend)
+
+        time.sleep(3)
+        submit_success = press_hotkey("<enter>", backend=keyboard_backend)
+        logger.info(
+            "Dry-run voice hotkey completed (focus_agent_success=%s toggel_voice_mode_success=%s submit_success=%s)",
+            focus_agent_success,
+            toggel_voice_mode_success,
+            submit_success,
+        )
+        sys.exit(0 if focus_agent_success and toggel_voice_mode_success and submit_success else 1)
+
     app = VoiceWakeupApp(
-        hotkey=args.hotkey,
+        toggle_voice_mode_hotkey=args.toggle_voice_mode_hotkey,
+        focus_agent_hotkey=args.focus_agent_hotkey,
         wake_word=args.wake_word,
-        submit_word=args.submit_word,
+        submit_keyword=args.submit_keyword,
         model_name=args.model_name,
     )
 

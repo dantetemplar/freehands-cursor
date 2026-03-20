@@ -14,6 +14,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "onnx-asr[cpu,hub]>=0.10.0",
     "pynput>=1.7.6",
+    "pywinctl>=0.4.1",
 ]
 
 [project.scripts]

@@ -29,20 +29,6 @@ def press_hotkey(hotkey_str: str, backend: KeyboardBackend) -> bool:
         assert_never(backend)
 
 
-def press_hotkey_twice(hotkey_str: str, backend: KeyboardBackend) -> bool:
-    """Press a key combination using the specified backend twice."""
-
-    success1 = press_hotkey(hotkey_str, backend=backend)
-    if not success1:
-        return False
-    time.sleep(0.1)
-    success2 = press_hotkey(hotkey_str, backend=backend)
-    if not success2:
-        return False
-    time.sleep(0.1)
-    return True
-
-
 def simulate_typing(delete_prev_chars: int, text: str, backend: KeyboardBackend) -> bool:
     """Simulate typing with the specified backend."""
     if backend == KeyboardBackend.PYNPUT:
