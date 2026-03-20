@@ -19,7 +19,7 @@ Before running `freehands-cursor`, you must set a keybind for Focus Agent (`comp
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # run from package
-uvx freehands-cursor
+uvx --from git+https://github.com/dantetemplar/freehands-cursor.git freehands-cursor
 ```
 
 If installed into an environment, both commands are available:
