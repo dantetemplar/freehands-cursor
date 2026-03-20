@@ -18,14 +18,12 @@ Before running `freehands-cursor`, you must set a keybind for Focus Agent (`comp
 # install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# run from package
-uvx --from git+https://github.com/dantetemplar/freehands-cursor.git freehands-cursor
+# install freehands-cursor
+uv tool install git+https://github.com/dantetemplar/freehands-cursor.git
+
+# run app
+freehands-cursor
 ```
-
-If installed into an environment, both commands are available:
-
-- `freehands-cursor`
-- `jarvis`
 
 ## CLI Options
 
